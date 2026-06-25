@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.ipynb_checkpoints/
+
+# Environments
+.env
+.venv/
+
+# Data and model artifacts — too large for git
+datasets/
+*.pt
+*.npy
+*.csv
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
