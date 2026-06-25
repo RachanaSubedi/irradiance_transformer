@@ -1,179 +1,395 @@
 # ════════════════════════════════════════════════════════════
-# scripts/prepare_deepkriging_inputs.py
-#
-# Harmonizes all 4 stations into identical format for Deep Kriging:
-#   - 3 complete stations: raw 5-min Ambient Weather → 30-min averaged
-#   - 1 imputed station:   already 30-min, just reformatted
-#
-# Output: 4 CSVs, each with exactly two columns [datetime, GHI]
-#         all on the SAME 30-min PST time grid, fully aligned.
-#
-# Timezone: PST (UTC-8, local standard, no DST) — matches NSRDB.
-#   Raw stations carry "-08:00" offset (already PST).
-#   Imputed station already converted to PST in finetuning Step 12.
+# LOAD EVERYTHING NEEDED
 # ════════════════════════════════════════════════════════════
 
-import os
+from pathlib import Path
+import sys
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.append(str(ROOT / "src"))
+
+from irradiance import config as cfg
+from irradiance.data import (
+    build_master,
+    process_station_utc,
+    process_nsrdb_utc,
+    build_finetune_sequences,
+    fix_missing_anchor,
+)
+from irradiance.model import TransformerImputer
+
+import pandas as pd
+import numpy as np
+import torch
+
+device = cfg.DEVICE
+
+# ────────────────────────────────────────────────────────────
+# CONFIG
+# ────────────────────────────────────────────────────────────
+
+ANCHOR1 = cfg.P2["anchor1"]
+ANCHOR2 = cfg.P2["anchor2"]
+
+SEQ_LEN = cfg.MODEL["seq_len"]
+CENTER  = cfg.MODEL["center"]
+
+feat_names_v2 = cfg.FEATURE_NAMES
+
+# ────────────────────────────────────────────────────────────
+# LOAD MODEL
+# ────────────────────────────────────────────────────────────
+
+print("Loading fine-tuned model...")
+
+model, ckpt = TransformerImputer.from_checkpoint(
+    cfg.ARTIFACTS["ft_model_v3"],
+    device=device
+)
+
+model.eval()
+
+# ────────────────────────────────────────────────────────────
+# BUILD MASTER
+# ────────────────────────────────────────────────────────────
+
+print("Building ft_master...")
+
+ft_master = build_master(cfg)
+
+# ────────────────────────────────────────────────────────────
+# LOAD P2 DATA
+# ────────────────────────────────────────────────────────────
+
+st_new = process_station_utc(
+    pd.read_csv(cfg.RAW["ghi_p2"]),
+    cfg.STATIONS["p2"]["lat"],
+    cfg.STATIONS["p2"]["lon"],
+    cfg.STATIONS["p2"]["alt"],
+)
+
+ns_new = process_nsrdb_utc(
+    pd.read_csv(cfg.RAW["nsrdb_p2"], skiprows=2),
+    "new"
+)
+
+# ────────────────────────────────────────────────────────────
+# BUILD IMPUTATION DATAFRAME
+# ────────────────────────────────────────────────────────────
+
+imp_df = ft_master.copy()
+
+# subset imputation period
+imp_df = imp_df[
+    (imp_df["datetime_naive"] >= pd.to_datetime(cfg.P2["imp_start"]).tz_localize(None)) &
+    (imp_df["datetime_naive"] <  pd.to_datetime(cfg.P2["imp_end"]).tz_localize(None))
+].copy()
+
+# ────────────────────────────────────────────────────────────
+# BUILD IMPUTATION SEQUENCES
+# ────────────────────────────────────────────────────────────
+
+print("Building imputation sequences...")
+
+X_imp, dt_imp = build_finetune_sequences(
+    imp_df,
+    ANCHOR1,
+    ANCHOR2,
+    seq_len=SEQ_LEN,
+    center=CENTER,
+    anchor_bad_thresh=0.95,
+    has_target=False,
+)
+
+X_imp_fixed, n_fixed = fix_missing_anchor(
+    X_imp,
+    center=CENTER,
+)
+print(f"  fix_missing_anchor: {n_fixed} sequences fixed")
+
+print(f"Imputation sequences: {len(X_imp_fixed):,}")
+
+# ════════════════════════════════════════════════════════════
+# scripts/diagnostics.py
+# Run AFTER fine-tuning. Requires all variables from
+# finetune_p2_v2.py to be in memory:
+#   imp_df, X_imp_fixed, dt_imp, X_ft_val, y_ft_val,
+#   ft_master, model, feat_names_v2, ANCHOR1, ANCHOR2
+# ════════════════════════════════════════════════════════════
+
 import numpy as np
 import pandas as pd
+import torch
 
-# ── CONFIG — edit paths here ─────────────────────────────────
-INPUT_DIR  = r"C:\Users\C838122727\Documents\CSU\research\deepkriging_solar\data\raw\stations"     # where raw CSVs live
-OUTPUT_DIR = r"C:\Users\C838122727\Documents\CSU\research\deepkriging_solar\data\processed"
-os.makedirs(OUTPUT_DIR, exist_ok=True)
+# ════════════════════════════════════════════════════════════
+# DIAGNOSTIC A — Skip reason breakdown
+# Tells us WHY sequences were skipped during imputation.
+# Hypothesis: S3 (anchor1) missing in Oct-Nov is the cause.
+# ════════════════════════════════════════════════════════════
 
-# The canonical 30-min PST grid every station is reindexed onto.
-# Full year 2024 in local standard time.
-GRID_START = "2024-01-01 00:00:00"
-GRID_END   = "2024-12-31 23:30:00"
+print("=" * 60)
+print("DIAGNOSTIC A — Imputation skip reason breakdown")
+print("=" * 60)
 
-# Complete stations: raw Ambient Weather 5-min files
-# (name, raw_filename, lat, lon)
-COMPLETE_STATIONS = [
-    ("S1", "46_59__-119_15_2024.csv", 46.594029, -119.152367),
-    # Add S2 and S3 with their actual filenames:
-    # ("S2", "46_82__-119_15_2024.csv", 46.823242, -119.163197),
-    # ("S3", "46_82__-119_16_2024.csv", 46.821036, -119.150761),
+cols_imp = list(imp_df.columns)
+def ci_imp(name): return cols_imp.index(name)
+
+i_a1_mask = ci_imp(f"CSI_{ANCHOR1}_mask")
+i_a2_mask = ci_imp(f"CSI_{ANCHOR2}_mask")
+
+data_imp = imp_df.values
+
+skip_anchor1_only = 0
+skip_anchor2_only = 0
+skip_both_anchors = 0
+kept              = 0
+
+# Also track skips by month
+skip_by_month = {m: {"anchor1": 0, "anchor2": 0, "both": 0, "kept": 0}
+                 for m in range(1, 13)}
+
+for i in range(len(imp_df) - SEQ_LEN + 1):
+    w = data_imp[i : i + SEQ_LEN]
+    frac_a1_bad = (w[:, i_a1_mask] == 0).mean()
+    frac_a2_bad = (w[:, i_a2_mask] == 0).mean()
+
+    # Get month from center step
+    m = imp_df["datetime_naive"].iloc[i + CENTER].month
+
+    if frac_a1_bad > 0.8 and frac_a2_bad > 0.8:
+        skip_both_anchors += 1
+        skip_by_month[m]["both"] += 1
+    elif frac_a1_bad > 0.8:
+        skip_anchor1_only += 1
+        skip_by_month[m]["anchor1"] += 1
+    elif frac_a2_bad > 0.8:
+        skip_anchor2_only += 1
+        skip_by_month[m]["anchor2"] += 1
+    else:
+        kept += 1
+        skip_by_month[m]["kept"] += 1
+
+total_windows = kept + skip_anchor1_only + skip_anchor2_only + skip_both_anchors
+
+print(f"\n  Total sliding windows:      {total_windows:,}")
+print(f"  Kept:                       {kept:,}  ({kept/total_windows*100:.1f}%)")
+print(f"  Skipped — anchor1 bad only: {skip_anchor1_only:,}  ({skip_anchor1_only/total_windows*100:.1f}%)  ← {ANCHOR1.upper()} problem")
+print(f"  Skipped — anchor2 bad only: {skip_anchor2_only:,}  ({skip_anchor2_only/total_windows*100:.1f}%)  ← {ANCHOR2.upper()} problem")
+print(f"  Skipped — both bad:         {skip_both_anchors:,}  ({skip_both_anchors/total_windows*100:.1f}%)")
+
+print(f"\n  anchor1 = {ANCHOR1.upper()} | anchor2 = {ANCHOR2.upper()}")
+if skip_anchor1_only > skip_anchor2_only * 3:
+    print(f"  ✅ Confirmed: {ANCHOR1.upper()} data gaps are the dominant skip cause")
+elif skip_anchor2_only > skip_anchor1_only * 3:
+    print(f"  ⚠️  Unexpected: {ANCHOR2.upper()} gaps are dominating — investigate")
+else:
+    print(f"  ℹ️  Skips are distributed between both anchors")
+
+# Monthly breakdown
+months_label = ["","Jan","Feb","Mar","Apr","May","Jun",
+                "Jul","Aug","Sep","Oct","Nov","Dec"]
+print(f"\n  Monthly skip breakdown:")
+print(f"  {'Month':>6} {'Kept':>8} {'A1 bad':>8} {'A2 bad':>8} {'Both bad':>10} {'Skip%':>7}")
+print(f"  {'-'*56}")
+for m in range(1, 12):
+    d = skip_by_month[m]
+    total_m = d["kept"] + d["anchor1"] + d["anchor2"] + d["both"]
+    if total_m == 0:
+        continue
+    skip_pct = (total_m - d["kept"]) / total_m * 100
+    flag = " ⚠️" if skip_pct > 50 else ""
+    print(f"  {months_label[m]:>6} {d['kept']:>8} {d['anchor1']:>8} "
+          f"{d['anchor2']:>8} {d['both']:>10} {skip_pct:>6.1f}%{flag}")
+
+# ════════════════════════════════════════════════════════════
+# DIAGNOSTIC B — Monthly permutation feature importance
+# Uses imputation sequences (no ground truth) so reports
+# prediction variance change rather than RMSE change.
+# Key question: is C13 more important in summer than winter?
+# ════════════════════════════════════════════════════════════
+
+print("\n" + "=" * 60)
+print("DIAGNOSTIC B — Permutation feature importance by month")
+print("(metric: change in prediction std when feature is shuffled)")
+print("=" * 60)
+
+dt_imp_pd  = pd.DatetimeIndex(dt_imp)
+months_imp = dt_imp_pd.month
+
+model.eval()
+
+months_to_check = [
+    (6,  "Jun — peak summer"),
+    (7,  "Jul — peak summer"),
+    (9,  "Sep — late summer"),
+    (10, "Oct — autumn, S3 gaps"),
+    (11, "Nov — winter onset"),
 ]
 
-# Imputed station: your model output
-IMPUTED_STATION = ("P2", "station_46_78_full_year_GHI_v2.csv",
-                   46.780547, -119.228783)
+# Features we care most about comparing
+key_features = [
+    "anchor1_CSI",
+    "anchor2_CSI",
+    "C13_norm_target",
+    "C13_norm_anchor1",
+    "C13_norm_anchor2",
+    "NSRDB_CSI_target",
+    "NSRDB_CSI_anchor1",
+    "hour_cos",
+]
 
-# Column names in raw Ambient Weather files
-RAW_DATE_COL = "Date"                          # ISO 8601 with -08:00 offset
-RAW_GHI_COL  = "Solar Radiation (W/m^2)"
+results_monthly = {}
 
-# Column names in imputed file
-IMP_DATE_COL = "datetime"                      # naive, already PST
-IMP_GHI_COL  = "GHI_imputed"
+for month_num, month_label in months_to_check:
+    mask = months_imp == month_num
+    if mask.sum() < 20:
+        print(f"\n  {month_label}: insufficient sequences ({mask.sum()}), skipping")
+        continue
 
-# ── Canonical grid ───────────────────────────────────────────
-GRID = pd.date_range(GRID_START, GRID_END, freq="30min")
-print(f"Canonical 30-min PST grid: {len(GRID)} timesteps "
-      f"({GRID[0]} → {GRID[-1]})\n")
+    X_month = X_imp_fixed[mask]
 
+    with torch.no_grad():
+        pred_base = model(
+            torch.tensor(X_month, dtype=torch.float32).to(device)
+        ).cpu().numpy()
 
-def process_complete_station(name, fname, lat, lon):
-    """
-    Raw 5-min Ambient Weather CSV → 30-min averaged GHI on PST grid.
+    base_std  = pred_base.std()
+    base_mean = pred_base.mean()
 
-    Steps:
-      1. Parse ISO timestamp (carries -08:00 = PST offset)
-      2. Convert to fixed PST naive datetime (UTC - 8h)
-      3. Resample 5-min → 30-min by mean
-      4. Reindex onto canonical grid (fills any gaps with NaN)
-    """
-    path = os.path.join(INPUT_DIR, fname)
-    print(f"[{name}] reading {fname} ...")
-    df = pd.read_csv(path)
+    print(f"\n  {month_label} — {mask.sum()} sequences")
+    print(f"  pred mean={base_mean:.3f}  pred std={base_std:.3f}")
+    print(f"  {'Feature':<24} {'Δstd':>8}  (positive = feature adds variance)")
 
-    # Parse the ISO timestamp. It contains -08:00, so utc=True gives
-    # correct UTC, then subtract 8h to get PST naive.
-    df["dt_utc"] = pd.to_datetime(df[RAW_DATE_COL], utc=True)
-    df["datetime"] = (df["dt_utc"] - pd.Timedelta(hours=8)).dt.tz_localize(None)
+    rng_diag = np.random.RandomState(42)
+    month_results = {}
+    for feat_idx, feat_name in enumerate(feat_names_v2):
+        if feat_name not in key_features:
+            continue
+        X_perm = X_month.copy()
+        pidx   = rng_diag.permutation(len(X_perm))
+        X_perm[:, :, feat_idx] = X_perm[pidx, :, feat_idx]
+        with torch.no_grad():
+            pred_perm = model(
+                torch.tensor(X_perm, dtype=torch.float32).to(device)
+            ).cpu().numpy()
+        delta_std = base_std - pred_perm.std()
+        month_results[feat_name] = delta_std
+        if abs(delta_std) > 0.001:
+            bar = "█" * max(0, int(abs(delta_std) * 300))
+            sign = "+" if delta_std > 0 else "-"
+            print(f"    {feat_name:<24} {delta_std:>+.4f}  {bar}")
 
-    df["GHI"] = pd.to_numeric(df[RAW_GHI_COL], errors="coerce")
-    df = df[["datetime", "GHI"]].sort_values("datetime").reset_index(drop=True)
+    results_monthly[month_label] = month_results
 
-    # Resample 5-min → 30-min mean (averages every 6 readings)
-    df = df.set_index("datetime")
-    df30 = df["GHI"].resample("30min").mean().reset_index()
+# Summary across months
+print(f"\n  Summary — C13 importance across months:")
+print(f"  {'Month':<30} {'C13_target':>12} {'C13_anchor1':>13} {'anchor1_CSI':>13}")
+print(f"  {'-'*72}")
+for month_label, res in results_monthly.items():
+    c13t  = res.get("C13_norm_target", 0)
+    c13a1 = res.get("C13_norm_anchor1", 0)
+    a1csi = res.get("anchor1_CSI", 0)
+    print(f"  {month_label:<30} {c13t:>+12.4f} {c13a1:>+13.4f} {a1csi:>+13.4f}")
 
-    # Reindex onto canonical grid so all stations share identical timestamps
-    df30 = df30.set_index("datetime").reindex(GRID).rename_axis("datetime").reset_index()
+print(f"\n  Interpretation:")
+print(f"    C13 Δstd > 0 → feature adds meaningful signal")
+print(f"    If C13 higher in summer → cloud variability is higher")
+print(f"    If anchor1_CSI >> C13 → model still anchor-dominated")
 
-    n_missing = df30["GHI"].isna().sum()
-    print(f"  raw rows: {len(df):,}  →  30-min rows: {len(df30):,}  "
-          f"(missing: {n_missing})")
+# ════════════════════════════════════════════════════════════
+# DIAGNOSTIC C — Anchor station data availability by month
+# Confirms whether S3 gaps explain Diagnostic A findings.
+# ════════════════════════════════════════════════════════════
 
-    # Optional: fill short gaps by interpolation (max 2 steps = 1 hour)
-    df30["GHI"] = df30["GHI"].interpolate(limit=2)
-
-    # Negative or tiny nighttime noise → clip to 0
-    df30["GHI"] = df30["GHI"].clip(lower=0)
-
-    return df30
-
-
-def process_imputed_station(name, fname, lat, lon):
-    """
-    Imputed model output → same 2-column 30-min PST format.
-    Already 30-min and already PST, so just rename + reindex.
-    """
-    path = os.path.join(INPUT_DIR, fname)
-    print(f"[{name}] reading {fname} ...")
-    df = pd.read_csv(path)
-    df["datetime"] = pd.to_datetime(df[IMP_DATE_COL])
-    df["GHI"] = pd.to_numeric(df[IMP_GHI_COL], errors="coerce")
-    df = df[["datetime", "GHI"]].sort_values("datetime").reset_index(drop=True)
-
-    # Reindex onto canonical grid
-    df = df.set_index("datetime").reindex(GRID).rename_axis("datetime").reset_index()
-
-    n_missing = df["GHI"].isna().sum()
-    print(f"  rows: {len(df):,}  (missing on grid: {n_missing})")
-    df["GHI"] = df["GHI"].interpolate(limit=2).clip(lower=0)
-    return df
-
-
-def save_station(df, name):
-    """Save with two clean columns and consistent float formatting."""
-    out_path = os.path.join(OUTPUT_DIR, f"{name}_GHI_30min_PST.csv")
-    df_out = df.copy()
-    df_out["GHI"] = df_out["GHI"].round(2)
-    df_out.to_csv(out_path, index=False)
-    print(f"  saved → {out_path}\n")
-    return out_path
-
-
-# ── Run all stations ─────────────────────────────────────────
-print("=" * 60)
-print("HARMONIZING STATIONS FOR DEEP KRIGING")
-print("=" * 60 + "\n")
-
-all_dfs = {}
-
-# Complete stations
-for name, fname, lat, lon in COMPLETE_STATIONS:
-    df = process_complete_station(name, fname, lat, lon)
-    save_station(df, name)
-    all_dfs[name] = df
-
-# Imputed station
-name, fname, lat, lon = IMPUTED_STATION
-df_imp = process_imputed_station(name, fname, lat, lon)
-save_station(df_imp, name)
-all_dfs[name] = df_imp
-
-# ── Build a combined wide table (one column per station) ─────
-print("Building combined wide table...")
-combined = pd.DataFrame({"datetime": GRID})
-for name, df in all_dfs.items():
-    combined = combined.merge(
-        df.rename(columns={"GHI": f"GHI_{name}"}),
-        on="datetime", how="left")
-
-combined_path = os.path.join(OUTPUT_DIR, "all_stations_GHI_30min_PST.csv")
-combined.to_csv(combined_path, index=False)
-print(f"  saved combined → {combined_path}")
-
-# ── Sanity check: solar noon alignment ───────────────────────
 print("\n" + "=" * 60)
-print("ALIGNMENT CHECK — June 17 peak GHI per station")
+print("DIAGNOSTIC C — Anchor station data availability by month")
 print("=" * 60)
-for name, df in all_dfs.items():
-    jun = df[(df["datetime"].dt.month == 6) & (df["datetime"].dt.day == 17)]
-    if jun["GHI"].notna().any():
-        peak = jun.loc[jun["GHI"].idxmax(), "datetime"]
-        # Daylight window
-        daylight = jun[jun["GHI"] > 5]
-        if len(daylight) > 0:
-            first = daylight["datetime"].iloc[0].strftime("%H:%M")
-            last  = daylight["datetime"].iloc[-1].strftime("%H:%M")
-            print(f"  {name}: peak {peak.strftime('%H:%M')} PST  |  "
-                  f"daylight {first}–{last} PST  |  "
-                  f"max {jun['GHI'].max():.0f} W/m²")
 
-print("\nAll 4 stations now share the identical 30-min PST grid.")
-print("Ready for Deep Kriging.")
+ft_master["_month_check"] = ft_master["datetime_naive"].dt.month
+
+print(f"\n  {'Month':>6} {'S1_valid':>10} {'S2_valid':>10} "
+      f"{'S3_valid':>10} {'S3_pct':>8} {'S3 status'}")
+print(f"  {'-'*62}")
+
+for m in range(1, 12):
+    sub = ft_master[
+        (ft_master["_month_check"] == m) &
+        (ft_master["solar_elev_s3"] > 5)
+    ]
+    if len(sub) == 0:
+        continue
+    s1_valid = (sub["CSI_s1"] > 0).sum()
+    s2_valid = (sub["CSI_s2"] > 0).sum()
+    s3_valid = (sub["CSI_s3"] > 0).sum()
+    s3_pct   = s3_valid / len(sub) * 100
+
+    if s3_pct < 10:
+        status = "⚠️  OFFLINE"
+    elif s3_pct < 50:
+        status = "⚠️  degraded"
+    elif s3_pct < 90:
+        status = "⚡ partial"
+    else:
+        status = "✅ good"
+
+    print(f"  {months_label[m]:>6} {s1_valid:>10} {s2_valid:>10} "
+          f"{s3_valid:>10} {s3_pct:>7.1f}%  {status}")
+
+ft_master.drop(columns=["_month_check"], inplace=True)
+
+print(f"\n  S3 = ANCHOR1 ({ANCHOR1.upper()})")
+print(f"  S1 = ANCHOR2 ({ANCHOR2.upper()})")
+print(f"\n  Connecting A → C:")
+print(f"  If S3 is OFFLINE in the same months as Diagnostic A")
+print(f"  shows high anchor1_bad skips → hypothesis confirmed.")
+print(f"  The anchor1 dominance in permutation importance is then")
+print(f"  explained by the model learning to compensate for S3 gaps")
+print(f"  using the S2 substitution we applied in fix_missing_anchor().")
+
+# ════════════════════════════════════════════════════════════
+# CROSS-DIAGNOSTIC SUMMARY
+# ════════════════════════════════════════════════════════════
+
+print("\n" + "=" * 60)
+print("CROSS-DIAGNOSTIC SUMMARY")
+print("=" * 60)
+
+# Identify which months had high anchor1 skips
+high_skip_months = [m for m in range(1, 12)
+                    if skip_by_month[m]["anchor1"] >
+                       skip_by_month[m]["kept"] * 0.3]
+
+# Re-check S3 availability for those months
+ft_master["_month_check"] = ft_master["datetime_naive"].dt.month
+s3_offline_months = []
+for m in range(1, 12):
+    sub = ft_master[
+        (ft_master["_month_check"] == m) &
+        (ft_master["solar_elev_s3"] > 5)
+    ]
+    if len(sub) == 0: continue
+    s3_pct = (sub["CSI_s3"] > 0).sum() / len(sub) * 100
+    if s3_pct < 20:
+        s3_offline_months.append(m)
+ft_master.drop(columns=["_month_check"], inplace=True)
+
+print(f"\n  Months with high anchor1 skip rate: "
+      f"{[months_label[m] for m in high_skip_months]}")
+print(f"  Months where S3 data < 20%:         "
+      f"{[months_label[m] for m in s3_offline_months]}")
+
+overlap = set(high_skip_months) & set(s3_offline_months)
+if overlap:
+    print(f"\n  ✅ CONFIRMED: {[months_label[m] for m in sorted(overlap)]} "
+          f"appear in both lists.")
+    print(f"     S3 sensor failure directly causes the gap fills.")
+    print(f"     This is a data quality issue, not a model limitation.")
+    print(f"\n  Thesis statement:")
+    print(f"     Station S3 recorded <20% valid daytime observations in "
+          f"{[months_label[m] for m in sorted(overlap)]}.")
+    print(f"     Imputation sequences with missing anchor1 were corrected")
+    print(f"     by substituting anchor2 (S1) values — consistent with")
+    print(f"     nearest-neighbor fallback used for other gap periods.")
+else:
+    print(f"\n  ⚠️  No strong overlap found — gap fills may have another cause.")
+    print(f"     Investigate boundary effects and NSRDB missing data.")

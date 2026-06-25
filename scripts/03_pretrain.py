@@ -2,7 +2,14 @@
 # scripts/03_pretrain.py
 # Build dataset + train Transformer encoder.
 # Run ONCE on GPU. Outputs saved to datasets folder.
-# Delete pretrain_best_model_v2.pt to retrain from scratch.
+# Delete pretrain_best_model_v3.pt to retrain from scratch.
+#
+# v3 changes from v2 (audit for GHI ceiling fix):
+#   - Trains on data built from snapshot-resampled stations
+#     (data.py fix — no more .mean() peak compression)
+#   - Uses the same tail-weighted MSE as fine-tuning, so the
+#     encoder itself learns to represent high-CSI states well
+#     before fine-tuning even starts.
 # ════════════════════════════════════════════════════════════
 
 import os, sys
@@ -18,21 +25,24 @@ from irradiance import config as cfg
 from irradiance.data import build_master, CSIDataset, build_pretrain_sequences
 from irradiance.model import TransformerImputer
 
+TAIL_THRESHOLD = cfg.FINETUNE["tail_threshold"]
+TAIL_WEIGHT    = cfg.FINETUNE["tail_weight"]
+
 # ── Guard — skip if already trained ──────────────────────────
-if os.path.exists(cfg.ARTIFACTS["pretrain_model_v2"]):
-    print(f"✅ pretrain_best_model_v2.pt already exists. Skipping pretraining.")
-    print(f"   Delete it to retrain: {cfg.ARTIFACTS['pretrain_model_v2']}")
+if os.path.exists(cfg.ARTIFACTS["pretrain_model_v3"]):
+    print(f"✅ pretrain_best_model_v3.pt already exists. Skipping pretraining.")
+    print(f"   Delete it to retrain: {cfg.ARTIFACTS['pretrain_model_v3']}")
     raise SystemExit(0)
 
 print("=" * 60)
-print("PRETRAINING V2 — 14 features")
+print("PRETRAINING V3 — 14 features, snapshot-resampled, tail-weighted loss")
 print("=" * 60)
 
 # ════════════════════════════════════════════════════════════
 # PART A — Build dataset
 # ════════════════════════════════════════════════════════════
 
-print("\n[A] Building pretraining dataset...")
+print("\n[A] Building pretraining dataset (snapshot-resampled stations)...")
 master = build_master(cfg)
 
 all_X, all_y, all_meta = [], [], []
@@ -55,7 +65,9 @@ idx = rng.permutation(len(X))
 X, y    = X[idx], y[idx]
 meta_df = meta_df.iloc[idx].reset_index(drop=True)
 
-print(f"\nDataset: X={X.shape}  y mean={y.mean():.3f}")
+print(f"\nDataset: X={X.shape}  y mean={y.mean():.3f}  y max={y.max():.3f}")
+n_tail = (y > TAIL_THRESHOLD).sum()
+print(f"Tail samples (CSI > {TAIL_THRESHOLD}): {n_tail:,} ({n_tail/len(y)*100:.1f}%)")
 print(f"Samples per task:\n{meta_df['task'].value_counts().to_string()}")
 
 print(f"\nFeature layout at center timestep:")
@@ -64,9 +76,9 @@ for i, name in enumerate(cfg.FEATURE_NAMES):
           f"mean={X[:, cfg.MODEL['center'], i].mean():+.3f}  "
           f"std={X[:, cfg.MODEL['center'], i].std():.3f}")
 
-np.save(cfg.ARTIFACTS["x_pretrain_v2"], X)
-np.save(cfg.ARTIFACTS["y_pretrain_v2"], y)
-meta_df.to_csv(cfg.ARTIFACTS["meta_pretrain_v2"], index=False)
+np.save(cfg.ARTIFACTS["x_pretrain_v3"], X)
+np.save(cfg.ARTIFACTS["y_pretrain_v3"], y)
+meta_df.to_csv(cfg.ARTIFACTS["meta_pretrain_v3"], index=False)
 print(f"\nSaved dataset ✅")
 
 # ════════════════════════════════════════════════════════════
@@ -97,13 +109,10 @@ train_loader = DataLoader(CSIDataset(X_train, y_train), batch_size=BS,   shuffle
 val_loader   = DataLoader(CSIDataset(X_val,   y_val),   batch_size=BS*2, shuffle=False)
 test_loader  = DataLoader(CSIDataset(X_test,  y_test),  batch_size=BS*2, shuffle=False)
 
-# ── Bug 1 fix: pass parameters explicitly using the correct argument
-#    names that TransformerImputer.__init__ expects.
-#    cfg.MODEL uses "n_heads" but the class uses "nhead" (PyTorch convention).
 model = TransformerImputer(
     input_dim  = cfg.MODEL["n_features"],
     d_model    = cfg.MODEL["d_model"],
-    nhead      = cfg.MODEL["n_heads"],     # ← was passing "n_heads" as kwarg name
+    nhead      = cfg.MODEL["n_heads"],
     num_layers = cfg.MODEL["n_layers"],
     d_ff       = cfg.MODEL["d_ff"],
     dropout    = cfg.MODEL["dropout"],
@@ -117,8 +126,20 @@ optimizer = torch.optim.Adam(model.parameters(), lr=cfg.TRAIN["lr"])
 scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
     optimizer, mode="min", factor=0.7, patience=5, min_lr=1e-6)
 
-# ── Bug 2 fix: nn.HuberLoss() not nn.MSELoss — must be instantiated with ()
-loss_fn = nn.HuberLoss(delta=0.1)
+
+def tail_weighted_mse(pred, target, threshold=TAIL_THRESHOLD, tail_weight=TAIL_WEIGHT):
+    """Same tail-weighted MSE used in fine-tuning — see 04_finetune.py
+    for full rationale. Applied here too so the encoder itself learns
+    good high-CSI representations during pretraining, not just the head."""
+    se = (pred - target) ** 2
+    weight = torch.ones_like(target)
+    weight = torch.where(target > threshold,
+                         torch.full_like(target, tail_weight),
+                         weight)
+    return (se * weight).mean()
+
+
+loss_fn = tail_weighted_mse
 
 best_val_loss = float("inf")
 best_state    = None
@@ -196,6 +217,14 @@ for task in ["hide_s1", "hide_s2", "hide_s3"]:
     r2t = 1 - ((tp - tt) ** 2).sum() / ((tt - tt.mean()) ** 2).sum()
     print(f"  {task}  RMSE={r:.4f}  R²={r2t:.4f}  N={m.sum()}")
 
+# ── Tail check on test set ─────────────────────────────────────
+tail_mask_pt = trues_pt > TAIL_THRESHOLD
+if tail_mask_pt.sum() > 0:
+    tail_rmse_pt = np.sqrt(((preds_pt[tail_mask_pt] - trues_pt[tail_mask_pt]) ** 2).mean())
+    tail_bias_pt = (preds_pt[tail_mask_pt] - trues_pt[tail_mask_pt]).mean()
+    print(f"\nPretraining tail check (CSI > {TAIL_THRESHOLD}, n={tail_mask_pt.sum()}):")
+    print(f"  Tail RMSE: {tail_rmse_pt:.4f}  |  Tail bias: {tail_bias_pt:+.4f}")
+
 # ── Save checkpoint ───────────────────────────────────────────
 torch.save({
     "model_state": best_state,
@@ -210,12 +239,15 @@ torch.save({
         "center":     cfg.MODEL["center"],
         "features":   cfg.FEATURE_NAMES,
     },
-    "best_epoch": best_epoch,
-    "val_loss":   best_val_loss,
-    "test_rmse":  float(rmse_pt),
-    "test_r2":    float(r2_pt),
-    "version":    "v2_14features",
-}, cfg.ARTIFACTS["pretrain_model_v2"])
+    "best_epoch":     best_epoch,
+    "val_loss":       best_val_loss,
+    "test_rmse":      float(rmse_pt),
+    "test_r2":        float(r2_pt),
+    "loss_fn":        "tail_weighted_mse",
+    "tail_threshold": TAIL_THRESHOLD,
+    "tail_weight":    TAIL_WEIGHT,
+    "version":        "v3_14features",
+}, cfg.ARTIFACTS["pretrain_model_v3"])
 
-print(f"\nSaved: {cfg.ARTIFACTS['pretrain_model_v2']} ✅")
+print(f"\nSaved: {cfg.ARTIFACTS['pretrain_model_v3']} ✅")
 print("\nNext: run scripts/04_finetune.py")

@@ -7,26 +7,44 @@
 import os
 import torch
 
-# ── Google Drive base ────────────────────────────────────────
-BASE_PATH = os.path.join(r"C:\Users\C838122727\Documents\CSU\research\IEEE 9500 bus Journal\IEEE9500\New 9500\irradiance_transformer_project\irradiance_transformer_project\datasets")
+# ── Base data directory ──────────────────────────────────────
+BASE_PATH = os.path.join(
+    r"C:\Users\C838122727\Documents\CSU\research\IEEE 9500 bus Journal",
+    "IEEE9500", "New 9500", "irradiance_transformer_project",
+    "irradiance_transformer_project", "datasets"
+)
+
+
+def _p(filename: str) -> str:
+    """
+    Build a path under BASE_PATH using os.path.join, never string
+    concatenation. This is the fix for the recurring PermissionError —
+    the old code did `BASE_PATH + "/" + filename`, which mixes Windows
+    backslashes with forward slashes and produces a malformed path
+    that Windows sometimes refuses to open even though it looks valid
+    when printed.
+    """
+    return os.path.normpath(os.path.join(BASE_PATH, filename))
+
 
 # ── Raw data files ───────────────────────────────────────────
 RAW = {
-    # Local GHI (Ambient Weather, 5-min → resampled 30-min)
-    "ghi_s1": BASE_PATH + "/46.59, -119.15 2024.csv",
-    "ghi_s2": BASE_PATH + "/46.82, -119.15 2024.csv",
-    "ghi_s3": BASE_PATH + "/46.82, -119.16 2024.csv",
-    "ghi_p2": BASE_PATH + "/46.78, -119.22 2024.csv",   # partial station
+    # Local GHI (Ambient Weather, 5-min → resampled 30-min via snapshot,
+    # NOT mean — see data.py process_station_utc for why)
+    "ghi_s1": _p("46.59, -119.15 2024.csv"),
+    "ghi_s2": _p("46.82, -119.15 2024.csv"),
+    "ghi_s3": _p("46.82, -119.16 2024.csv"),
+    "ghi_p2": _p("46.78, -119.22 2024.csv"),   # partial station
 
     # NSRDB (30-min, skiprows=2, LST → +8h → UTC)
-    "nsrdb_s1": BASE_PATH + "/768989_46.60_-119.15_2024.csv",
-    "nsrdb_s2": BASE_PATH + "/767670_46.82_-119.17_2024.csv",
-    "nsrdb_s3": BASE_PATH + "/768978_46.82_-119.15_2024.csv",
-    "nsrdb_p2": BASE_PATH + "/763752_46.78_-119.23_2024.csv",
+    "nsrdb_s1": _p("768989_46.60_-119.15_2024.csv"),
+    "nsrdb_s2": _p("767670_46.82_-119.17_2024.csv"),
+    "nsrdb_s3": _p("768978_46.82_-119.15_2024.csv"),
+    "nsrdb_p2": _p("763752_46.78_-119.23_2024.csv"),
 
     # GOES-18 C13 brightness temperature (30-min, GEE export)
-    "c13_complete": BASE_PATH + "/goes18_c13_s2_s3_30min_2024_gee.csv",   # s1,s2,s3
-    "c13_p2":       BASE_PATH + "/goes18_c13_s1_30min_2024_gee_new.csv",  # s5_c13 = P2
+    "c13_complete": _p("goes18_c13_s2_s3_30min_2024_gee.csv"),   # s1,s2,s3
+    "c13_p2":       _p("goes18_c13_s1_30min_2024_gee_new.csv"),  # s5_c13 = P2
 }
 
 # ── Station coordinates ──────────────────────────────────────
@@ -78,10 +96,17 @@ TRAIN = {
 }
 
 FINETUNE = {
-    "lr":           3e-5,
-    "patience":     15,
-    "real_repeat":  8,    # repeat real overlap sequences N times
-    "batch_size":   64,
+    "lr":              3e-5,
+    "patience":        15,
+    "real_repeat":     8,      # repeat real overlap sequences N times
+    "batch_size":      64,
+    # ── Tail-weighting for CSI loss (fixes high-CSI compression) ──
+    # Samples with CSI above this threshold get extra loss weight,
+    # which counteracts the systematic under-prediction of clear-sky
+    # peaks that occurs with plain MSE/Huber on an imbalanced dataset
+    # where >0.85 CSI samples are only ~5-7% of training data.
+    "tail_threshold":  0.85,
+    "tail_weight":     3.0,    # weight multiplier for samples above threshold
 }
 
 # ── Feature names (must match sequence builder order) ────────
@@ -112,18 +137,27 @@ PRETRAIN_TASKS = [
 # ── Saved artifact paths ─────────────────────────────────────
 ARTIFACTS = {
     # v1
-    "pretrain_model_v1":   BASE_PATH + "/pretrain_best_model.pt",
-    "ghi_csv_v1":          BASE_PATH + "/station_46_78_full_year_GHI_v1_RMSE0996.csv",
-    "ft_model_v1":         BASE_PATH + "/finetune_frozen_46_78_synth_v1_RMSE0996.pt",
+    "pretrain_model_v1":   _p("pretrain_best_model.pt"),
+    "ghi_csv_v1":          _p("station_46_78_full_year_GHI_v1_RMSE0996.csv"),
+    "ft_model_v1":         _p("finetune_frozen_46_78_synth_v1_RMSE0996.pt"),
 
     # v2
-    "x_pretrain_v2":       BASE_PATH + "/X_pretrain_v2.npy",
-    "y_pretrain_v2":       BASE_PATH + "/y_pretrain_v2.npy",
-    "meta_pretrain_v2":    BASE_PATH + "/meta_pretrain_v2.csv",
-    "pretrain_model_v2":   BASE_PATH + "/pretrain_best_model_v2.pt",
-    "ft_model_v2":         BASE_PATH + "/finetune_frozen_46_78_synth_v2.pt",
-    "ghi_csv_v2":          BASE_PATH + "/station_46_78_full_year_GHI_v2.csv",
-    "plot_v2":             BASE_PATH + "/full_year_GHI_analysis_v3.png",
+    "x_pretrain_v2":       _p("X_pretrain_v2.npy"),
+    "y_pretrain_v2":       _p("y_pretrain_v2.npy"),
+    "meta_pretrain_v2":    _p("meta_pretrain_v2.csv"),
+    "pretrain_model_v2":   _p("pretrain_best_model_v2.pt"),
+    "ft_model_v2":         _p("finetune_frozen_46_78_synth_v2.pt"),
+    "ghi_csv_v2":          _p("station_46_78_full_year_GHI_v2.csv"),
+    "plot_v2":             _p("full_year_GHI_analysis_v3.png"),
+
+    # v3 (tail-weighted retrain — this audit)
+    "x_pretrain_v3":       _p("X_pretrain_v3.npy"),
+    "y_pretrain_v3":       _p("y_pretrain_v3.npy"),
+    "meta_pretrain_v3":    _p("meta_pretrain_v3.csv"),
+    "pretrain_model_v3":   _p("pretrain_best_model_v3.pt"),
+    "ft_model_v3":         _p("finetune_frozen_46_78_synth_v3.pt"),
+    "ghi_csv_v3":          _p("station_46_78_full_year_GHI_v3.csv"),
+    "plot_v3":             _p("finetune_results_v3.png"),
 }
 
 # ── Device ────────────────────────────────────────────────────

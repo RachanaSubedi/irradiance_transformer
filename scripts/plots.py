@@ -37,7 +37,7 @@ MONTHS = ["Jan","Feb","Mar","Apr","May","Jun",
 
 print("Loading full year CSV...")
 
-df = pd.read_csv(cfg.ARTIFACTS["ghi_csv_v2"])
+df = pd.read_csv(cfg.ARTIFACTS["ghi_csv_v3"])
 
 df["datetime"] = pd.to_datetime(df["datetime"])
 

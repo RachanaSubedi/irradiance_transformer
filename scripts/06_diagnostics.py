@@ -43,7 +43,7 @@ feat_names_v2 = cfg.FEATURE_NAMES
 print("Loading fine-tuned model...")
 
 model, ckpt = TransformerImputer.from_checkpoint(
-    cfg.ARTIFACTS["ft_model_v2"],
+    cfg.ARTIFACTS["ft_model_v3"],
     device=device
 )
 
@@ -81,8 +81,8 @@ imp_df = ft_master.copy()
 
 # subset imputation period
 imp_df = imp_df[
-    (imp_df["datetime_naive"] >= cfg.P2["imp_start"]) &
-    (imp_df["datetime_naive"] <  cfg.P2["imp_end"])
+    (imp_df["datetime_naive"] >= pd.to_datetime(cfg.P2["imp_start"]).tz_localize(None)) &
+    (imp_df["datetime_naive"] <  pd.to_datetime(cfg.P2["imp_end"]).tz_localize(None))
 ].copy()
 
 # ────────────────────────────────────────────────────────────
@@ -101,11 +101,11 @@ X_imp, dt_imp = build_finetune_sequences(
     has_target=False,
 )
 
-X_imp_fixed = fix_missing_anchor(
+X_imp_fixed, n_fixed = fix_missing_anchor(
     X_imp,
-    feat_names_v2,
-    anchor_name=ANCHOR1
+    center=CENTER,
 )
+print(f"  fix_missing_anchor: {n_fixed} sequences fixed")
 
 print(f"Imputation sequences: {len(X_imp_fixed):,}")
 

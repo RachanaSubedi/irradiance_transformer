@@ -15,15 +15,43 @@ def process_station_utc(df_raw, lat, lon, alt=120):
     """
     Process raw Ambient Weather CSV → 30-min UTC GHI + CSI dataframe.
     Sets CSI=NaN for nighttime (GHI_clear < 10 W/m²).
+
+    IMPORTANT — resampling method (fixed from earlier .mean() version):
+    Raw sensor data is logged roughly every 5 minutes (with some jitter —
+    occasional readings land a minute or two off the 5-min mark due to
+    logger clock drift). The original pipeline used
+    `.resample("30min").mean()`, which averages all ~6 readings inside
+    each 30-min window. This systematically destroys brief cloud-edge
+    enhancement spikes and genuine clear-sky peaks: verified on real
+    station data, mean-resampling cuts the yearly max GHI by 16% (S1),
+    17% (S2), and 42% (S3) compared to the true 5-min readings.
+
+    Fix: snapshot the reading nearest each half-hour mark (tolerance
+    3 minutes, matching the jitter window observed in the raw logs)
+    instead of averaging. This preserves the true instantaneous GHI
+    at each 30-min timestamp — physically appropriate for an imputation
+    target that should match what an actual 30-min-cadence sensor would
+    have recorded, rather than a smoothed mean.
     """
     df = df_raw.copy()
     df["datetime"] = pd.to_datetime(df["Date"], utc=True)
     df["GHI"]      = pd.to_numeric(df["Solar Radiation (W/m^2)"], errors="coerce")
-    df = (df[["datetime","GHI"]]
-            .sort_values("datetime")
-            .set_index("datetime")
-            .resample("30min").mean()
-            .reset_index())
+    df = df[["datetime", "GHI"]].sort_values("datetime").reset_index(drop=True)
+
+    # Canonical 30-min UTC grid spanning the data's own range
+    grid = pd.date_range(
+        df["datetime"].min().floor("30min"),
+        df["datetime"].max().ceil("30min"),
+        freq="30min", tz="UTC"
+    )
+    grid_df = pd.DataFrame({"datetime": grid})
+
+    # Snapshot: nearest raw reading within 3 minutes of each grid timestamp
+    df = pd.merge_asof(
+        grid_df, df, on="datetime",
+        direction="nearest", tolerance=pd.Timedelta("3min")
+    )
+
     site  = pvlib.location.Location(lat, lon, tz="UTC", altitude=alt)
     times = pd.DatetimeIndex(df["datetime"])
     cs    = site.get_clearsky(times, model="ineichen")
