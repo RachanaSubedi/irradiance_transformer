@@ -8,11 +8,23 @@ import os
 import torch
 
 # ── Base data directory ──────────────────────────────────────
-BASE_PATH = os.path.join(
-    r"C:\Users\C838122727\Documents\CSU\research\IEEE 9500 bus Journal",
-    "IEEE9500", "New 9500", "irradiance_transformer_project",
-    "irradiance_transformer_project", "datasets"
-)
+# Auto-detects OS so this same file works unmodified on both your
+# local Windows machine and Cashew (or any Linux cluster) — no
+# manual editing needed when switching environments.
+#
+# If you clone this repo to a different path on Cashew than
+# /home/C838122727/irradiance_transformer, update the Linux
+# branch below to match.
+if os.name == "nt":
+    # Windows (local machine)
+    BASE_PATH = os.path.join(
+        r"C:\Users\C838122727\Documents\CSU\research\IEEE 9500 bus Journal",
+        "IEEE9500", "New 9500", "irradiance_transformer_project",
+        "irradiance_transformer_project", "datasets"
+    )
+else:
+    # Linux (Cashew / any HPC cluster)
+    BASE_PATH = "/home/C838122727/irradiance_transformer/datasets"
 
 
 def _p(filename: str) -> str:
@@ -140,7 +152,7 @@ TRAIN = {
                               # with increasing amplitude after epoch 2,
                               # classic too-high-LR signature on the
                               # larger 5-min dataset
-    "patience":     15,       # tightened from 15 for faster iteration
+    "patience":     6,       # tightened from 15 for faster iteration
                               # while tuning; raise back once LR is stable
     "seed":         42,
 }
