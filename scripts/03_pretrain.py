@@ -2,9 +2,22 @@
 # scripts/03_pretrain.py
 # Build dataset + train Transformer encoder.
 # Run ONCE on GPU. Outputs saved to datasets folder.
-# Delete pretrain_best_model_v3.pt to retrain from scratch.
+# Delete pretrain_best_model_v4.pt to retrain from scratch.
 #
-# v3 changes from v2 (audit for GHI ceiling fix):
+# v4 changes from v3 (5-min resolution migration):
+#   - Native 5-min resolution throughout (was 30-min) — stations,
+#     NSRDB, and C13 are now all natively 5-min, no downsampling.
+#   - seq_len=72/center=35 (6-hour window @ 5-min, was 48/23 =
+#     24-hour window @ 30-min). Chose a shorter window rather than
+#     scaling to seq_len=288 (24h @ 5-min) — that would cost ~15x
+#     more attention compute and force the model to learn very
+#     long-range dependencies unlikely to be predictive.
+#   - Added C02 (GOES-18 visible/red band reflectance) as a new
+#     feature, parallel to C13 (target/anchor1/anchor2 slots) —
+#     17 features total, was 14.
+#   - C13 calibration: new GEE extraction provides raw DN, not
+#     Kelvin — divided by 10 inside process_c13_c02_utc (verified
+#     against historical calibrated values, ~291K mean both ways).
 #   - Trains on data built from snapshot-resampled stations
 #     (data.py fix — no more .mean() peak compression)
 #   - Uses the same tail-weighted MSE as fine-tuning, so the
@@ -29,9 +42,9 @@ TAIL_THRESHOLD = cfg.FINETUNE["tail_threshold"]
 TAIL_WEIGHT    = cfg.FINETUNE["tail_weight"]
 
 # ── Guard — skip if already trained ──────────────────────────
-if os.path.exists(cfg.ARTIFACTS["pretrain_model_v3"]):
-    print(f"✅ pretrain_best_model_v3.pt already exists. Skipping pretraining.")
-    print(f"   Delete it to retrain: {cfg.ARTIFACTS['pretrain_model_v3']}")
+if os.path.exists(cfg.ARTIFACTS["pretrain_model_v4"]):
+    print(f"✅ pretrain_best_model_v4.pt already exists. Skipping pretraining.")
+    print(f"   Delete it to retrain: {cfg.ARTIFACTS['pretrain_model_v4']}")
     raise SystemExit(0)
 
 print("=" * 60)
@@ -76,9 +89,9 @@ for i, name in enumerate(cfg.FEATURE_NAMES):
           f"mean={X[:, cfg.MODEL['center'], i].mean():+.3f}  "
           f"std={X[:, cfg.MODEL['center'], i].std():.3f}")
 
-np.save(cfg.ARTIFACTS["x_pretrain_v3"], X)
-np.save(cfg.ARTIFACTS["y_pretrain_v3"], y)
-meta_df.to_csv(cfg.ARTIFACTS["meta_pretrain_v3"], index=False)
+np.save(cfg.ARTIFACTS["x_pretrain_v4"], X)
+np.save(cfg.ARTIFACTS["y_pretrain_v4"], y)
+meta_df.to_csv(cfg.ARTIFACTS["meta_pretrain_v4"], index=False)
 print(f"\nSaved dataset ✅")
 
 # ════════════════════════════════════════════════════════════
@@ -246,8 +259,8 @@ torch.save({
     "loss_fn":        "tail_weighted_mse",
     "tail_threshold": TAIL_THRESHOLD,
     "tail_weight":    TAIL_WEIGHT,
-    "version":        "v3_14features",
-}, cfg.ARTIFACTS["pretrain_model_v3"])
+    "version":        "v4_17features_5min",
+}, cfg.ARTIFACTS["pretrain_model_v4"])
 
-print(f"\nSaved: {cfg.ARTIFACTS['pretrain_model_v3']} ✅")
+print(f"\nSaved: {cfg.ARTIFACTS['pretrain_model_v4']} ✅")
 print("\nNext: run scripts/04_finetune.py")

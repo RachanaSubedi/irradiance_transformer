@@ -42,8 +42,13 @@ df = pd.read_csv(cfg.ARTIFACTS["ghi_csv_v3"])
 df["datetime"] = pd.to_datetime(df["datetime"])
 
 df["month"]       = df["datetime"].dt.month
-df["hour_utc"]    = df["datetime"].dt.hour + df["datetime"].dt.minute / 60
-df["hour_pst"]    = (df["hour_utc"] - 8) % 24
+# NOTE: datetime is ALREADY PST — it was converted from UTC to PST in
+# 04_finetune.py Step 12 before the CSV was saved. Treating it as UTC
+# here and subtracting another 8h was a double-shift bug: it silently
+# rotated every day's hour labels by 8 hours, which is why "clear day"
+# and "cloudy day" plots showed truncated, wrong-shaped curves (solar
+# noon appeared at hour ~4 instead of hour 12).
+df["hour_pst"]    = df["datetime"].dt.hour + df["datetime"].dt.minute / 60
 df["date"]        = df["datetime"].dt.date
 df["day_of_year"] = df["datetime"].dt.day_of_year
 

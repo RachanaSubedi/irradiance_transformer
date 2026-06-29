@@ -85,7 +85,8 @@ print("=" * 60)
 
 # ── Step 1: Load partial station GHI ─────────────────────────
 print("\n[1] Loading partial station GHI (snapshot-resampled)...")
-st_new = process_station_utc(pd.read_csv(LOCAL_GHI_PATH), NEW_LAT, NEW_LON, NEW_ALT)
+st_new = process_station_utc(pd.read_csv(LOCAL_GHI_PATH), NEW_LAT, NEW_LON, NEW_ALT,
+                              fill_gaps=False)
 print(f"  Rows: {len(st_new)} | daytime CSI: {st_new['CSI'].notna().sum()}")
 print(f"  Range: {st_new['datetime'].min()} → {st_new['datetime'].max()}")
 print(f"  Max GHI in real P2 overlap window: {st_new['GHI'].max():.1f} W/m²")
@@ -166,7 +167,7 @@ baseline_rmse = np.sqrt(((X_ft_val[:, cfg.MODEL["center"], 0] - y_ft_val) ** 2).
 print(f"\n  Baseline RMSE ({ANCHOR1.upper()} direct): {baseline_rmse:.4f} CSI")
 
 # ── Step 6: Synthetic proxy sequences ────────────────────────
-print("\n[6] Building synthetic proxy sequences (S2 as proxy target)...")
+print("\n[6] Building synthetic proxy sequences (S2 as proxy target, bias-corrected)...")
 synth_df = master[
     (master["datetime"] >= pd.Timestamp(IMP_START, tz="UTC")) &
     (master["datetime"] <  pd.Timestamp(IMP_END,   tz="UTC"))
@@ -176,7 +177,56 @@ synth_df = pd.merge_asof(
     synth_df.sort_values("datetime"),
     ft_master[["datetime", "NSRDB_CSI_new", "c13_new_norm"]].sort_values("datetime"),
     on="datetime", direction="nearest", tolerance=pd.Timedelta("16min"))
-synth_df["CSI_new"]      = synth_df["CSI_s2"]
+
+# ── Bias correction (this is the fix for the ~810 W/m² ceiling) ──
+# Diagnosis: S2 (the synthetic proxy target) systematically reads
+# 5-19% LOWER than S3 (anchor1) on S3's clearest days (verified on
+# real station data: mean CSI_s2/CSI_s3 ratio = 0.946 in the high-CSI
+# regime). Since 60% of fine-tuning gradient updates come from S2-as-
+# target sequences, the model learns this discount as if it were a
+# real property of P2 — but it isn't. Real measured P2 data during
+# the Nov-Dec overlap tracks S3 at a 0.97 mean ratio, not 0.946 and
+# nowhere near the ~0.74-0.81 effective ratio the v3 model was
+# producing on clear days.
+#
+# Fix: rescale the synthetic target toward what the REAL P2-S3
+# relationship implies, rather than training directly against S2's
+# raw value. We blend S2 (which gives correct day-to-day cloud
+# DYNAMICS — when it's cloudy vs clear) with a correction factor
+# derived from S3 (which gives the correct PEAK MAGNITUDE, since
+# anchor1 is the model's dominant feature anyway).
+#
+# REAL_P2_S3_RATIO measured from actual Nov-Dec overlap ground truth.
+# Update this if you regenerate the ratio check with more real data.
+REAL_P2_S3_RATIO = 0.97
+
+synth_df["CSI_new_raw_s2"] = synth_df["CSI_s2"]
+# Where S2 systematically under-reads relative to S3 (the discount
+# we diagnosed), nudge the synthetic target back toward S3's scale.
+# Only apply the correction where both signals are valid (>=0) and
+# S3 indicates a clear-ish sample (CSI_s3 > 0.5) — this is precisely
+# the regime where the discount was measured and matters for the
+# ceiling; in cloudy/ambiguous conditions we trust S2's dynamics as-is.
+s3_valid = synth_df["CSI_s3"] >= 0
+s2_valid = synth_df["CSI_new_raw_s2"] >= 0
+clearish = synth_df["CSI_s3"] > 0.5
+correct_mask = s3_valid & s2_valid & clearish
+
+blend_weight = 0.6  # 60% pulled toward S3-implied target, 40% keep S2 dynamics
+target_from_s3 = synth_df["CSI_s3"] * REAL_P2_S3_RATIO
+
+synth_df["CSI_new"] = synth_df["CSI_new_raw_s2"]
+synth_df.loc[correct_mask, "CSI_new"] = (
+    blend_weight * target_from_s3[correct_mask]
+    + (1 - blend_weight) * synth_df.loc[correct_mask, "CSI_new_raw_s2"]
+)
+
+n_corrected = correct_mask.sum()
+mean_shift = (synth_df.loc[correct_mask, "CSI_new"]
+              - synth_df.loc[correct_mask, "CSI_new_raw_s2"]).mean()
+print(f"  Bias-corrected {n_corrected:,} synthetic samples toward S3 scale "
+      f"(mean shift: {mean_shift:+.4f} CSI)")
+
 synth_df["CSI_new_mask"] = (synth_df["CSI_new"] >= 0).astype(np.float32)
 synth_df = synth_df.reset_index(drop=True)
 
@@ -187,6 +237,9 @@ X_synth, y_synth, _ = build_finetune_sequences(
     anchor_bad_thresh=0.9,
     has_target=True)
 print(f"  Synthetic: {len(X_synth):,} | y mean={y_synth.mean():.3f} | y max={y_synth.max():.3f}")
+n_synth_tail = (y_synth > TAIL_THRESHOLD).sum()
+print(f"  Synthetic tail samples (CSI > {TAIL_THRESHOLD}): "
+      f"{n_synth_tail:,} ({n_synth_tail/len(y_synth)*100:.1f}%)")
 
 # ── Step 7: Load pretrained model + partial unfreeze ──────────
 print("\n[7] Loading pretrained v3 model...")
@@ -497,8 +550,23 @@ real_part = real_part[["datetime", "CSI_imputed", "GHI_imputed", "GHI_clear", "s
 full_year = pd.concat([imp_result, real_part], ignore_index=True
                       ).sort_values("datetime").reset_index(drop=True)
 
+# Boundary overlap fix: imp_result runs through IMP_END and real_part
+# (P2's own raw data range) can start slightly before that boundary if
+# P2's actual first reading predates the configured OVERLAP_START by a
+# few hours. Where both a real "measured" row and a model "imputed" row
+# exist for the same timestamp, keep the real one — measured ground
+# truth should always take priority over a model prediction.
+full_year["source"] = pd.Categorical(
+    full_year["source"], categories=["measured", "imputed_synth_ft_v3"], ordered=True)
+full_year = (full_year
+             .sort_values(["datetime", "source"])
+             .drop_duplicates(subset="datetime", keep="first")
+             .reset_index(drop=True))
+full_year["source"] = full_year["source"].astype(str)
+
 full_spine = pd.DataFrame({"datetime": pd.date_range(
-    full_year["datetime"].min(), full_year["datetime"].max(), freq="30min")})
+    pd.Timestamp(IMP_START, tz="UTC").tz_localize(None),
+    full_year["datetime"].max(), freq="30min")})
 fy = pd.merge(full_spine, full_year, on="datetime", how="left").copy()
 missing_mask = fy["source"].isna()
 n_missing    = missing_mask.sum()
@@ -511,17 +579,63 @@ if n_missing > 0:
     gap_df = pd.DataFrame({"datetime": missing_dt})
     gap_df = pd.merge_asof(
         gap_df.sort_values("datetime"),
-        ft_master[["datetime", "CSI_s2", "GHI_clear_s2"]].sort_values("datetime"),
+        ft_master[["datetime", "CSI_s2", "GHI_clear_s2",
+                   "CSI_s1", "GHI_clear_s1",
+                   "NSRDB_CSI_s2"]].sort_values("datetime"),
         on="datetime", direction="nearest", tolerance=pd.Timedelta("16min"))
 
-    # .copy() is required here: pandas ≥2.0 Copy-on-Write semantics can
-    # return a read-only array from .values after a .clip()/.fillna()
-    # chain, which raises "assignment destination is read-only" on the
-    # in-place mutations below (gap_ghi[night] = 0.0 etc). This bug is
-    # version-dependent — reproduces on pandas 3.0, may or may not on
-    # older versions depending on CoW settings, so the explicit .copy()
-    # is the version-safe fix either way.
-    gap_csi = gap_df["CSI_s2"].clip(lower=0).fillna(0.0).to_numpy().copy()
+    # ── Cascading fallback: S2 → S1 → NSRDB → 0 ───────────────
+    # BUG (found via real data): S2 and S3 share a common-cause outage
+    # window (Nov 10-18, verified on real station data). Within that
+    # window, Nov 13-15 had S1 still online (two-station outage,
+    # recoverable via S1 fallback). But Nov 16-18 had ALL THREE
+    # Ambient Weather stations down simultaneously through ~11:30
+    # each morning — a genuine triple-station outage with no local
+    # sensor data of any kind to fall back to.
+    #
+    # NSRDB_CSI_s2 is satellite/model-derived, not a local sensor, so
+    # it is unaffected by whatever caused the Ambient Weather outage
+    # (verified: real NSRDB data for this exact window shows a normal
+    # rising morning profile, e.g. Nov 16 07:30-11:30 GHI rising
+    # 24→296 W/m², matching expected sunrise behavior). Adding it as
+    # a third fallback tier recovers genuine signal for the triple-
+    # outage days that S1/S2 cascading alone cannot reach.
+    #
+    # Missing-value sentinel is -1.0 (see build_master), checked
+    # BEFORE clipping — clip(lower=0) would otherwise destroy the
+    # missingness signal (caught this exact bug in an earlier version
+    # of this fix).
+    s2_missing    = gap_df["CSI_s2"] < 0
+    s1_missing    = gap_df["CSI_s1"] < 0
+    nsrdb_missing = gap_df["NSRDB_CSI_s2"] < 0
+
+    s2_csi    = gap_df["CSI_s2"].clip(lower=0)
+    s1_csi    = gap_df["CSI_s1"].clip(lower=0)
+    nsrdb_csi = gap_df["NSRDB_CSI_s2"].clip(lower=0)
+
+    use_s1    = s2_missing & ~s1_missing
+    use_nsrdb = s2_missing & s1_missing & ~nsrdb_missing
+    still_zero = s2_missing & s1_missing & nsrdb_missing
+
+    gap_csi_filled = s2_csi.copy()
+    gap_csi_filled[use_s1]    = s1_csi[use_s1]
+    gap_csi_filled[use_nsrdb] = nsrdb_csi[use_nsrdb]
+    gap_csi_filled[still_zero] = np.nan  # explicit, handled by fillna below
+
+    n_s1_fallback    = int(use_s1.sum())
+    n_nsrdb_fallback = int(use_nsrdb.sum())
+    n_still_missing  = int(still_zero.sum())
+    if n_s1_fallback > 0:
+        print(f"  ⚠️  S2 also missing for {n_s1_fallback} gap-fill rows — "
+              f"fell back to S1")
+    if n_nsrdb_fallback > 0:
+        print(f"  ⚠️  S2 and S1 both missing for {n_nsrdb_fallback} rows — "
+              f"fell back to NSRDB")
+    if n_still_missing > 0:
+        print(f"  ⚠️  S2, S1, and NSRDB all missing for {n_still_missing} "
+              f"rows — these remain zero (total data outage)")
+
+    gap_csi = gap_csi_filled.fillna(0.0).to_numpy().copy()
     gap_ghi = (gap_csi * cs_gap["ghi"].to_numpy()).copy()
     night   = sp_gap["apparent_elevation"].to_numpy() <= 1
     gap_ghi[night] = 0.0
@@ -530,7 +644,12 @@ if n_missing > 0:
     fy.loc[missing_mask, "CSI_imputed"]  = gap_csi
     fy.loc[missing_mask, "GHI_clear"]    = cs_gap["ghi"].to_numpy().copy()
     fy.loc[missing_mask, "solar_elev"]   = sp_gap["apparent_elevation"].to_numpy().copy()
-    fy.loc[missing_mask, "source"]       = "gap_fill_s2_copy"
+
+    # Track actual source per row for transparency
+    source_labels = np.full(len(gap_csi_filled), "gap_fill_s2_copy", dtype=object)
+    source_labels[use_s1.to_numpy()]    = "gap_fill_s1_fallback"
+    source_labels[use_nsrdb.to_numpy()] = "gap_fill_nsrdb_fallback"
+    fy.loc[missing_mask, "source"] = source_labels
     n_day = (sp_gap["apparent_elevation"].to_numpy() > 5).sum()
     print(f"  Daytime gap-filled: {n_day} | Nighttime: {n_missing - n_day}")
 

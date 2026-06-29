@@ -12,7 +12,6 @@ from irradiance import config as cfg
 from irradiance.data import (
     build_master,
     process_station_utc,
-    process_nsrdb_utc,
     build_finetune_sequences,
     fix_missing_anchor,
 )
@@ -55,7 +54,7 @@ model.eval()
 
 print("Building ft_master...")
 
-ft_master = build_master(cfg)
+master = build_master(cfg)
 
 # ────────────────────────────────────────────────────────────
 # LOAD P2 DATA
@@ -66,12 +65,56 @@ st_new = process_station_utc(
     cfg.STATIONS["p2"]["lat"],
     cfg.STATIONS["p2"]["lon"],
     cfg.STATIONS["p2"]["alt"],
+    fill_gaps=False,
 )
 
-ns_new = process_nsrdb_utc(
-    pd.read_csv(cfg.RAW["nsrdb_p2"], skiprows=2),
-    "new"
-)
+ns_raw = pd.read_csv(cfg.RAW["nsrdb_p2"], skiprows=2)
+for col in ["Year", "Month", "Day", "Hour", "Minute", "GHI", "Clearsky GHI"]:
+    ns_raw[col] = pd.to_numeric(ns_raw[col], errors="coerce")
+ns_raw["datetime"] = (pd.to_datetime({
+    "year":   ns_raw["Year"].astype(int),
+    "month":  ns_raw["Month"].astype(int),
+    "day":    ns_raw["Day"].astype(int),
+    "hour":   ns_raw["Hour"].astype(int),
+    "minute": ns_raw["Minute"].astype(int),
+}) + pd.Timedelta(hours=8)).dt.tz_localize("UTC")
+ns_raw["NSRDB_CSI_new"] = (ns_raw["GHI"] / ns_raw["Clearsky GHI"]).clip(0, 1.5)
+ns_raw.loc[ns_raw["Clearsky GHI"] < 10, "NSRDB_CSI_new"] = np.nan
+ns_new = ns_raw[["datetime", "NSRDB_CSI_new"]].sort_values("datetime").reset_index(drop=True)
+
+# ── C13 (matches 04_finetune.py Step 2 exactly — diagnostics.py was
+# previously missing this entirely, which is the root cause of the
+# "NSRDB_CSI_new is not in list" crash: ft_master never got these
+# columns merged in below) ─────────────────────────────────────────
+c13_raw = pd.read_csv(cfg.RAW["c13_p2"])
+c13_raw["datetime"] = pd.to_datetime(c13_raw["datetime_local"], utc=True)
+C13_NEW_COL = cfg.C13_COLS["p2"]
+c13_raw[C13_NEW_COL] = pd.to_numeric(c13_raw[C13_NEW_COL], errors="coerce")
+c13_mean = c13_raw[C13_NEW_COL].mean()
+c13_std  = c13_raw[C13_NEW_COL].std()
+c13_raw["c13_new_norm"] = (c13_raw[C13_NEW_COL] - c13_mean) / c13_std
+c13_new = c13_raw[["datetime", "c13_new_norm"]].sort_values("datetime").reset_index(drop=True)
+
+# ── Merge P2 data into ft_master (this whole block was missing) ───
+ft_master = master.copy()
+for df_merge in [ns_new, c13_new]:
+    ft_master = pd.merge_asof(
+        ft_master.sort_values("datetime"),
+        df_merge.sort_values("datetime"),
+        on="datetime", direction="nearest",
+        tolerance=pd.Timedelta("16min"))
+
+ft_master = pd.merge_asof(
+    ft_master.sort_values("datetime"),
+    st_new[["datetime", "CSI"]].rename(columns={"CSI": "CSI_new"}).sort_values("datetime"),
+    on="datetime", direction="nearest", tolerance=pd.Timedelta("16min"))
+
+ft_master["NSRDB_CSI_new"] = ft_master["NSRDB_CSI_new"].fillna(-1.0)
+ft_master["c13_new_norm"]   = ft_master["c13_new_norm"].ffill(limit=2).fillna(0.0)
+ft_master["CSI_new"]        = ft_master["CSI_new"].fillna(-1.0)
+ft_master["CSI_new_mask"]   = (ft_master["CSI_new"] >= 0).astype(np.float32)
+ft_master = ft_master.reset_index(drop=True)
+print(f"  ft_master shape: {ft_master.shape}")
 
 # ────────────────────────────────────────────────────────────
 # BUILD IMPUTATION DATAFRAME
@@ -124,7 +167,11 @@ import torch
 # ════════════════════════════════════════════════════════════
 # DIAGNOSTIC A — Skip reason breakdown
 # Tells us WHY sequences were skipped during imputation.
-# Hypothesis: S3 (anchor1) missing in Oct-Nov is the cause.
+# Historical hypothesis (now resolved — see Diagnostic C note):
+# S3 (anchor1) had a real 46-day raw data gap that used to drive
+# most skips here. Fixed in data.py's process_station_utc, so
+# this diagnostic should now report 0 skips for any reason. Kept
+# to catch any NEW anchor-availability problem in future data.
 # ════════════════════════════════════════════════════════════
 
 print("=" * 60)
@@ -222,7 +269,7 @@ months_to_check = [
     (6,  "Jun — peak summer"),
     (7,  "Jul — peak summer"),
     (9,  "Sep — late summer"),
-    (10, "Oct — autumn, S3 gaps"),
+    (10, "Oct — autumn"),
     (11, "Nov — winter onset"),
 ]
 
@@ -297,8 +344,99 @@ print(f"    If C13 higher in summer → cloud variability is higher")
 print(f"    If anchor1_CSI >> C13 → model still anchor-dominated")
 
 # ════════════════════════════════════════════════════════════
+# PLOT — Feature importance by month
+# Two views of the same results_monthly data:
+#   1. Grouped bar chart — every feature, every month, side by side
+#   2. Heatmap — compact view, easier to spot seasonal patterns
+# ════════════════════════════════════════════════════════════
+
+import matplotlib
+matplotlib.use("Agg")  # headless-safe; remove if running in a notebook
+import matplotlib.pyplot as plt
+import numpy as np
+import os
+
+months_plotted  = list(results_monthly.keys())
+features_plotted = key_features  # same feature list used in Diagnostic B
+
+# Build a (months x features) matrix, missing values → 0
+importance_matrix = np.array([
+    [results_monthly[m].get(f, 0.0) for f in features_plotted]
+    for m in months_plotted
+])
+
+# ── Plot 1: Grouped bar chart ─────────────────────────────────
+fig1, ax1 = plt.subplots(figsize=(14, 6))
+x = np.arange(len(features_plotted))
+width = 0.8 / len(months_plotted)
+colors = plt.cm.viridis(np.linspace(0, 1, len(months_plotted)))
+
+for i, month_label in enumerate(months_plotted):
+    offset = (i - len(months_plotted) / 2) * width + width / 2
+    ax1.bar(x + offset, importance_matrix[i], width,
+            label=month_label, color=colors[i], alpha=0.9)
+
+ax1.axhline(0, color="black", lw=0.8)
+ax1.set_xticks(x)
+ax1.set_xticklabels(features_plotted, rotation=30, ha="right", fontsize=9)
+ax1.set_ylabel("Δstd (permutation importance)", fontsize=11)
+ax1.set_title("Feature Importance by Month — Grouped Comparison",
+              fontsize=13, fontweight="bold")
+ax1.legend(fontsize=9, ncol=len(months_plotted), loc="upper center",
+           bbox_to_anchor=(0.5, -0.18))
+ax1.grid(True, alpha=0.3, axis="y")
+ax1.spines["top"].set_visible(False)
+ax1.spines["right"].set_visible(False)
+plt.tight_layout()
+
+bar_plot_path = os.path.normpath(
+    os.path.join(cfg.BASE_PATH, "feature_importance_by_month_bars.png"))
+plt.savefig(bar_plot_path, dpi=150, bbox_inches="tight")
+plt.close(fig1)
+print(f"\n  Saved: {bar_plot_path} ✅")
+
+# ── Plot 2: Heatmap ────────────────────────────────────────────
+fig2, ax2 = plt.subplots(figsize=(10, 5))
+vmax = np.abs(importance_matrix).max()
+im = ax2.imshow(importance_matrix, cmap="RdBu_r", vmin=-vmax, vmax=vmax,
+                 aspect="auto")
+
+ax2.set_xticks(np.arange(len(features_plotted)))
+ax2.set_xticklabels(features_plotted, rotation=30, ha="right", fontsize=9)
+ax2.set_yticks(np.arange(len(months_plotted)))
+ax2.set_yticklabels(months_plotted, fontsize=9)
+ax2.set_title("Feature Importance Heatmap\n(Red = positive impact, Blue = negative)",
+              fontsize=12, fontweight="bold")
+
+# Annotate each cell with its value
+for i in range(len(months_plotted)):
+    for j in range(len(features_plotted)):
+        val = importance_matrix[i, j]
+        text_color = "white" if abs(val) > vmax * 0.6 else "black"
+        ax2.text(j, i, f"{val:+.3f}", ha="center", va="center",
+                  fontsize=7.5, color=text_color)
+
+plt.colorbar(im, ax=ax2, label="Δstd (permutation importance)")
+plt.tight_layout()
+
+heatmap_path = os.path.normpath(
+    os.path.join(cfg.BASE_PATH, "feature_importance_heatmap.png"))
+plt.savefig(heatmap_path, dpi=150, bbox_inches="tight")
+plt.close(fig2)
+print(f"  Saved: {heatmap_path} ✅")
+
+# ════════════════════════════════════════════════════════════
 # DIAGNOSTIC C — Anchor station data availability by month
-# Confirms whether S3 gaps explain Diagnostic A findings.
+# Historical note: this diagnostic was originally written to
+# confirm a hypothesis that S3 sensor failures (a real, large gap
+# verified in the raw data: 46 missing days, mostly Oct 4-Nov 18)
+# were the dominant cause of imputation sequence skips. That gap
+# has since been fixed at the resampling layer (data.py's
+# process_station_utc now self-fills it from the station's own
+# seasonal CSI pattern — see Tier 2b in that function). S1/S2/S3
+# should now all show ~100% availability every month. This
+# diagnostic is kept to verify that remains true going forward
+# (e.g. if a NEW raw data file introduces a fresh gap).
 # ════════════════════════════════════════════════════════════
 
 print("\n" + "=" * 60)
@@ -379,17 +517,34 @@ print(f"  Months where S3 data < 20%:         "
       f"{[months_label[m] for m in s3_offline_months]}")
 
 overlap = set(high_skip_months) & set(s3_offline_months)
-if overlap:
+total_skipped = (skip_anchor1_only + skip_anchor2_only + skip_both_anchors)
+
+if total_skipped == 0:
+    print(f"\n  ✅ Zero sequences skipped for any anchor-availability reason.")
+    print(f"     S1/S2/S3 all show complete data this run (see Diagnostic C —")
+    print(f"     should read 100% for every month). This confirms the")
+    print(f"     data.py self-contained gap-filling fix (Tier 1/2a/2b in")
+    print(f"     process_station_utc) is working as intended: the historical")
+    print(f"     S3 outage (46 missing days, mostly Oct 4 - Nov 18) that")
+    print(f"     used to drive most imputation skips no longer causes any.")
+    print(f"\n  Thesis statement (current state):")
+    print(f"     All three reference stations (S1, S2, S3) provide complete")
+    print(f"     30-minute GHI coverage for the full year after self-contained")
+    print(f"     gap-filling (median within-day or seasonal CSI estimation —")
+    print(f"     see Methods). No imputation sequence was skipped due to")
+    print(f"     missing anchor data in this run.")
+elif overlap:
     print(f"\n  ✅ CONFIRMED: {[months_label[m] for m in sorted(overlap)]} "
           f"appear in both lists.")
-    print(f"     S3 sensor failure directly causes the gap fills.")
-    print(f"     This is a data quality issue, not a model limitation.")
+    print(f"     An anchor station data gap is the dominant skip cause in")
+    print(f"     these months. This is a data quality issue, not a model")
+    print(f"     limitation — check which raw file introduced this gap.")
     print(f"\n  Thesis statement:")
-    print(f"     Station S3 recorded <20% valid daytime observations in "
-          f"{[months_label[m] for m in sorted(overlap)]}.")
-    print(f"     Imputation sequences with missing anchor1 were corrected")
-    print(f"     by substituting anchor2 (S1) values — consistent with")
-    print(f"     nearest-neighbor fallback used for other gap periods.")
+    print(f"     One or more reference stations recorded <20% valid daytime")
+    print(f"     observations in {[months_label[m] for m in sorted(overlap)]}.")
+    print(f"     Imputation sequences affected by this gap were corrected")
+    print(f"     via the anchor-substitution fallback in fix_missing_anchor().")
 else:
-    print(f"\n  ⚠️  No strong overlap found — gap fills may have another cause.")
-    print(f"     Investigate boundary effects and NSRDB missing data.")
+    print(f"\n  ⚠️  Skips exist ({total_skipped} total) but don't cleanly overlap")
+    print(f"     with low anchor availability — investigate boundary effects,")
+    print(f"     NSRDB missing data, or the anchor_bad_thresh setting itself.")
