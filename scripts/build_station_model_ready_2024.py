@@ -74,11 +74,25 @@ def load_raw_station(path: Path) -> pd.DataFrame:
 
 
 def align_station(raw: pd.DataFrame, timeline: pd.DataFrame) -> pd.DataFrame:
+    # Pandas may parse ISO CSV timestamps at microsecond resolution while the
+    # synthetic timeline is nanosecond resolution. merge_asof requires exact
+    # dtype agreement, so normalize precision explicitly without rounding.
+    left = timeline.copy()
+    right = raw.copy()
+    left["datetime"] = pd.Series(
+        pd.DatetimeIndex(left["datetime"]).as_unit("ns"),
+        index=left.index,
+    )
+    right["datetime"] = pd.Series(
+        pd.DatetimeIndex(right["datetime"]).as_unit("ns"),
+        index=right.index,
+    )
+
     # Logger timestamps should already lie on the 5-min grid. A 90-second
     # tolerance permits clock jitter without borrowing an adjacent reading.
     return pd.merge_asof(
-        timeline,
-        raw,
+        left,
+        right,
         on="datetime",
         direction="nearest",
         tolerance=pd.Timedelta(seconds=90),
