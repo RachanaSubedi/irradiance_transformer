@@ -244,6 +244,10 @@ class SpatiotemporalWindowDataset(Dataset):
         elapsed = np.array(
             self.station["time_since_csi_observed_minutes"][sl], copy=True
         )
+        meteorology = np.array(self.station["meteorology"][sl], copy=True)
+        meteorology_mask = np.array(
+            self.station["meteorology_valid_mask"][sl], copy=True
+        )
 
         source_station_mask = self._source_station_mask(target)
         hidden_station_mask = source_station_mask == 0
@@ -252,6 +256,10 @@ class SpatiotemporalWindowDataset(Dataset):
             input_csi[:, target] = 0.0
             input_mask[:, target] = 0
             elapsed[:, target] = 1440.0
+            # Simulate a genuinely unavailable target station. P2 has no
+            # target-site meteorology during its long pre-installation gap.
+            meteorology[:, target] = 0.0
+            meteorology_mask[:, target] = 0
 
         # P2 truth is reserved from pseudo-target pretraining by default.
         for station_index in np.flatnonzero(hidden_station_mask):
@@ -259,6 +267,8 @@ class SpatiotemporalWindowDataset(Dataset):
                 input_csi[:, station_index] = 0.0
                 input_mask[:, station_index] = 0
                 elapsed[:, station_index] = 1440.0
+                meteorology[:, station_index] = 0.0
+                meteorology_mask[:, station_index] = 0
 
         result = {
             "station_csi": _copy_tensor(input_csi, torch.float32),
@@ -271,10 +281,10 @@ class SpatiotemporalWindowDataset(Dataset):
                 self.station["cos_zenith"][sl], torch.float32
             ),
             "meteorology": _copy_tensor(
-                self.station["meteorology"][sl], torch.float32
+                meteorology, torch.float32
             ),
             "meteorology_mask": _copy_tensor(
-                self.station["meteorology_valid_mask"][sl], torch.bool
+                meteorology_mask, torch.bool
             ),
             "time_encoding": _copy_tensor(
                 self.station["time_encoding"][sl], torch.float32
